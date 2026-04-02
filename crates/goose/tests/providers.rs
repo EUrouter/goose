@@ -182,6 +182,11 @@ impl ProviderTestConfig {
         self
     }
 
+    fn test_mode_update(mut self, v: bool) -> Self {
+        self.test_mode_update = v;
+        self
+    }
+
     fn expect_context_length_exceeded(mut self, v: bool) -> Self {
         self.expect_context_length_exceeded = v;
         self
@@ -198,7 +203,6 @@ impl ProviderTestConfig {
             skip,
             expected_session_id: || Arc::new(IgnoreSessionId),
             test_smart_approve: false,
-            test_mode_update: false,
             test_context_length_exceeded: false,
             ..Self::with_llm_provider(name, model_name, &[])
         }
@@ -605,12 +609,12 @@ impl ProviderFixture {
         self.agent
             .update_goose_mode(GooseMode::Approve, &self.session_id)
             .await?;
-        // Verify tool call now requires permission (ActionRequired).
-        // Cancel prevents the task from completing → tool fails.
+        // Use a write prompt so ACP agents trigger sandbox permission requests.
+        let test_file = tempfile::NamedTempFile::new()?;
         self.run_permission_test(
             Permission::Cancel,
             true,
-            "Use the get_code tool and output only its result.",
+            &format!("Write the word 'hello' to {}", test_file.path().display()),
             "mode_update",
         )
         .await
@@ -871,6 +875,7 @@ async fn test_xai_provider() -> Result<()> {
 async fn test_claude_code_provider() -> Result<()> {
     ProviderTestConfig::with_agentic_provider("claude-code", CLAUDE_CODE_DEFAULT_MODEL, "claude")
         .model_switch_name("sonnet")
+        .test_mode_update(false)
         .run()
         .await
 }
@@ -879,6 +884,7 @@ async fn test_claude_code_provider() -> Result<()> {
 async fn test_codex_provider() -> Result<()> {
     ProviderTestConfig::with_agentic_provider("codex", CODEX_DEFAULT_MODEL, "codex")
         .test_permissions(false)
+        .test_mode_update(false)
         .run()
         .await
 }

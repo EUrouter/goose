@@ -1,3 +1,4 @@
+use crate::config::search_path::SearchPaths;
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use anyhow::{Context, Result};
 use async_stream::try_stream;
@@ -38,7 +39,7 @@ use crate::subprocess::configure_subprocess;
 pub const ACP_CURRENT_MODEL: &str = "current";
 
 pub struct AcpProviderConfig {
-    pub command: PathBuf,
+    pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub env_remove: Vec<String>,
@@ -121,7 +122,7 @@ enum AcpUpdate {
 
 pub struct AcpProvider {
     name: String,
-    model: ModelConfig,
+    model: Mutex<ModelConfig>,
     goose_mode: Arc<Mutex<GooseMode>>,
     tx: Option<mpsc::Sender<ClientRequest>>,
     loop_thread: Option<JoinHandle<()>>,
@@ -136,6 +137,8 @@ pub struct AcpProvider {
     session_model: Arc<TokioMutex<HashMap<String, String>>>,
     auth_methods: Vec<AuthMethod>,
     supports_close: bool,
+    // Cached NewSessionResponse for model list and config resolution.
+    // Populated from whichever comes first: ensure_session or get_init_session.
     init_session: OnceCell<NewSessionResponse>,
 }
 
@@ -226,7 +229,7 @@ impl AcpProvider {
             .session_capabilities
             .close
             .is_some();
-        let mut provider = Self::new_with_runtime(
+        let provider = Self::new_with_runtime(
             name,
             model,
             goose_mode,
@@ -238,12 +241,6 @@ impl AcpProvider {
             init_response.auth_methods,
             supports_close,
         );
-        if provider.model.model_name == ACP_CURRENT_MODEL {
-            let response = provider.get_init_session().await?;
-            let (current_model, _) = resolve_model_info(&provider.name, response)?;
-            tracing::info!(from = ACP_CURRENT_MODEL, to = %current_model, "resolved ACP model");
-            provider.model.model_name = current_model;
-        }
         Ok(provider)
     }
 
@@ -262,7 +259,7 @@ impl AcpProvider {
     ) -> Self {
         Self {
             name,
-            model,
+            model: Mutex::new(model),
             goose_mode,
             tx: Some(tx),
             loop_thread: Some(loop_thread),
@@ -472,7 +469,10 @@ impl AcpProvider {
                 .lock()
                 .await
                 .entry(session_id.to_string())
-                .or_insert(current_model);
+                .or_insert(current_model.clone());
+
+            self.cache_session_metadata(response.clone(), current_model)
+                .await;
         }
 
         Ok(response)
@@ -497,6 +497,14 @@ impl AcpProvider {
         Ok(response_rx)
     }
 
+    async fn cache_session_metadata(&self, response: NewSessionResponse, model: String) {
+        self.init_session.get_or_init(|| async { response }).await;
+        let mut m = self.model.lock().unwrap();
+        if m.model_name == ACP_CURRENT_MODEL {
+            m.model_name = model;
+        }
+    }
+
     async fn get_init_session(&self) -> Result<&NewSessionResponse> {
         self.init_session
             .get_or_try_init(|| async {
@@ -504,6 +512,12 @@ impl AcpProvider {
                 if self.supports_close {
                     self.close_session_by_acp_id(response.session_id.clone())
                         .await?;
+                }
+                let (model, _) =
+                    resolve_model_info(&self.name, &response).map_err(anyhow::Error::from)?;
+                let mut m = self.model.lock().unwrap();
+                if m.model_name == ACP_CURRENT_MODEL {
+                    m.model_name = model;
                 }
                 Ok(response)
             })
@@ -532,7 +546,17 @@ impl Provider for AcpProvider {
     }
 
     fn get_model_config(&self) -> ModelConfig {
-        self.model.clone()
+        self.model.lock().unwrap().clone()
+    }
+
+    // ACP agents push titles via session_info_update (SessionInfoUpdate.title).
+    // https://github.com/agentclientprotocol/agent-client-protocol/blob/188d9b0/src/client.rs#L195
+    async fn generate_session_name(
+        &self,
+        _session_id: &str,
+        _messages: &crate::conversation::Conversation,
+    ) -> Result<String, ProviderError> {
+        Ok(String::new())
     }
 
     async fn update_mode(&self, session_id: &str, mode: GooseMode) -> Result<(), ProviderError> {
@@ -592,11 +616,11 @@ impl Provider for AcpProvider {
     ) -> Result<MessageStream, ProviderError> {
         let response = self.ensure_session(Some(session_id)).await?;
 
-        // Provider trait has no update_model — stream() is the only place to forward model changes.
+        // Forward model changes to the agent. Skip "current" (resolved lazily by ensure_session).
         {
             let new_model = &model_config.model_name;
             let tracked = self.session_model.lock().await.get(session_id).cloned();
-            if tracked.as_deref() != Some(new_model) {
+            if new_model != ACP_CURRENT_MODEL && tracked.as_deref() != Some(new_model) {
                 if self
                     .session_has_config_option(session_id, SessionConfigOptionCategory::Model)
                     .await
@@ -807,6 +831,7 @@ impl AcpClientLoop {
                 {
                     let prompt_response_tx = prompt_response_tx.clone();
                     let reverse_modes = reverse_modes.clone();
+                    let goose_mode = goose_mode.clone();
                     async move |notification: SessionNotification, _cx| {
                         if let Some(ref cb) = notification_callback {
                             cb(notification.clone());
@@ -915,7 +940,7 @@ impl AcpClientLoop {
                 sacp::on_receive_request!(),
             )
             .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
-                handle_requests(config, cx, rx, prompt_response_tx, init_tx).await
+                handle_requests(config, goose_mode, cx, rx, prompt_response_tx, init_tx).await
             })
             .await?;
 
@@ -924,7 +949,9 @@ impl AcpClientLoop {
 }
 
 async fn spawn_acp_process(config: &AcpProviderConfig) -> Result<Child> {
-    let mut cmd = Command::new(&config.command);
+    // with_npm() includes npm global bin dir (desktop app PATH may not)
+    let resolved = SearchPaths::builder().with_npm().resolve(&config.command)?;
+    let mut cmd = Command::new(&resolved);
     cmd.args(&config.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -952,6 +979,7 @@ fn log_undelivered<E: std::fmt::Debug>(result: Result<(), E>, method: &str) {
 
 async fn handle_requests(
     config: AcpProviderConfig,
+    goose_mode: Arc<Mutex<GooseMode>>,
     cx: ConnectionTo<Agent>,
     rx: &mut mpsc::Receiver<ClientRequest>,
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
@@ -997,7 +1025,12 @@ async fn handle_requests(
                 let result = match session {
                     Ok(session) => {
                         session_ids.push(session.session_id.clone());
-                        apply_session_mode(&config, &cx, session).await
+                        let mode_id = goose_mode
+                            .lock()
+                            .ok()
+                            .and_then(|m| config.mode_mapping.get(&*m).cloned())
+                            .or_else(|| config.session_mode_id.clone());
+                        apply_session_mode(mode_id, &cx, session).await
                     }
                     Err(err) => Err(anyhow::anyhow!(
                         "ACP {} failed: {err}",
@@ -1143,11 +1176,11 @@ async fn handle_requests(
 }
 
 async fn apply_session_mode(
-    config: &AcpProviderConfig,
+    desired_mode_id: Option<String>,
     cx: &ConnectionTo<Agent>,
     session: NewSessionResponse,
 ) -> Result<NewSessionResponse> {
-    if let (Some(mode_id), Some(modes)) = (config.session_mode_id.clone(), session.modes.as_ref()) {
+    if let (Some(mode_id), Some(modes)) = (desired_mode_id, session.modes.as_ref()) {
         if modes.current_mode_id.0.as_ref() != mode_id.as_str() {
             let available: Vec<String> = modes
                 .available_modes
@@ -1406,8 +1439,8 @@ fn permission_decision_from_mode(goose_mode: GooseMode) -> Option<PermissionDeci
     }
 }
 
-// TODO: ID mapping is in-memory only — sessions from prior runs or other clients are dropped.
-// Persisting requires a schema change to map goose↔ACP IDs in the session DB.
+// TODO: ID mapping is in-memory only. Sessions from prior runs or other clients are dropped.
+// Persistence is a non-goal as we want to change to honoring agent-supplied IDs.
 fn map_sessions_to_goose_ids(
     response: ListSessionsResponse,
     acp_to_goose: &HashMap<String, String>,
