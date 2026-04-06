@@ -7,7 +7,10 @@
   "base_url": "https://api.eurouter.ai/api/v1",
   "models": [],
   "dynamic_models": true,
-  "headers": null,
+  "headers": {
+    "HTTP-Referer": "https://block.github.io/goose",
+    "X-EUrouter-Title": "Goose"
+  },
   "timeout_seconds": null,
   "supports_streaming": true
 }
